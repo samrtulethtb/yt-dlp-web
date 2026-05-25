@@ -1,0 +1,11 @@
+services:
+  ytdlp-web:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./cookies.txt:/app/cookies.txt:ro  # optional
+    environment:
+      - PORT=8080
+      - MAX_SIZE_MB=500
+    restart: unless-stopped

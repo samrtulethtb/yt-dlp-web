@@ -1,0 +1,11 @@
+# Netscape HTTP Cookie File
+# Export from your browser using "Get cookies.txt LOCALLY" extension
+# https://chrome.google.com/webstore/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc
+#
+# Instructions:
+# 1. Log in to YouTube (or any platform) in Chrome/Firefox
+# 2. Click the extension icon → Export cookies
+# 3. Save as cookies.txt next to main.py
+# 4. Restart the server
+#
+# This file unlocks: age-restricted videos, member-only content, private playlists

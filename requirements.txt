@@ -1,0 +1,7 @@
+# yt-dlp Web — Python dependencies
+# Install: pip install -r requirements.txt
+
+fastapi>=0.115.0
+uvicorn>=0.30.0
+yt-dlp>=2024.12.1
+python-multipart>=0.0.9
