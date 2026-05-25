@@ -47,7 +47,7 @@ sudo apt install ffmpeg
 
 ```bash
 # 1. Clone
-git clone https://github.com/your-username/ytdlp-web
+git clone https://github.com/samrtulethtb/yt-dlp-web
 cd ytdlp-web
 
 # 2. Create virtual environment
@@ -71,7 +71,7 @@ Open **http://localhost:8080** in your browser.
 ## Windows Step-by-Step
 
 ```bat
-git clone https://github.com/your-username/ytdlp-web
+git clone https://github.com/samrtulethtb/yt-dlp-web
 cd ytdlp-web
 python -m venv venv
 venv\Scripts\activate
@@ -134,7 +134,7 @@ docker run -p 8080:8080 -v ./cookies.txt:/app/cookies.txt:ro ytdlp-web
 
 ```bash
 # Clone & install
-git clone https://github.com/your-username/ytdlp-web
+git clone https://github.com/samrtulethtb/yt-dlp-web
 cd ytdlp-web
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
