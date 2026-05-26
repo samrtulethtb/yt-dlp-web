@@ -48,7 +48,7 @@ sudo apt install ffmpeg
 ```bash
 # 1. Clone
 git clone https://github.com/samrtulethtb/yt-dlp-web
-cd ytdlp-web
+cd yt-dlp-web
 
 # 2. Create virtual environment
 python3 -m venv venv
