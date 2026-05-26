@@ -172,6 +172,9 @@ server {
 
 ---
 
+## Support
+If this saved you time, consider giving it a ⭐ — it helps others find the project.
+
 ## License
 
 MIT — do whatever you want with it.
