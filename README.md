@@ -4,6 +4,9 @@ A clean, self-hosted web frontend for [yt-dlp](https://github.com/yt-dlp/yt-dlp)
 Download videos and audio from YouTube, TikTok, Instagram, Twitter, Reddit, and 1000+ platforms — locally, with no ads and no limits.
 
 > **Don't want to self-host?** Use the free hosted version at **[noadsdl.com](https://noadsdl.com)** — zero ads, zero signup, same yt-dlp engine.
+> 
+<img width="758" height="1035" alt="frontend-download" src="https://github.com/user-attachments/assets/23228abd-6388-4fa4-a5ea-5f27593e1f47" />
+<img width="744" height="564" alt="frontend-index" src="https://github.com/user-attachments/assets/64eca607-6634-4a9c-ac57-84e418943311" />
 
 ---
 
