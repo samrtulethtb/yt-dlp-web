@@ -1,5 +1,7 @@
 # yt-dlp/web
 
+[![CI](https://github.com/samrtulethtb/yt-dlp-web/actions/workflows/ci.yml/badge.svg)](https://github.com/samrtulethtb/yt-dlp-web/actions/workflows/ci.yml)
+
 A clean, self-hosted web frontend for [yt-dlp](https://github.com/yt-dlp/yt-dlp).
 Download videos and audio from YouTube, TikTok, Instagram, Twitter, Reddit, and 1000+ platforms — on your own computer, with no ads and no limits.
 

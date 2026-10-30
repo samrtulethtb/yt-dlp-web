@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -r requirements-dev.txt
+      - run: python -m pytest -q
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build and start with docker compose
+        run: docker compose up -d --build
+
+      - name: Health check answers, with Deno for YouTube
+        run: |
+          for i in $(seq 1 60); do
+            curl -fsS http://127.0.0.1:8080/api/health > health.json && break
+            sleep 2
+          done
+          cat health.json
+          python3 -c "import json; d = json.load(open('health.json')); assert d['js_runtime'] == 'deno', d; assert d['ytdlp_version'] != 'not found', d"
+
+      - name: Image runs as a normal user and has Deno and ffmpeg
+        run: |
+          test "$(docker compose exec -T ytdlp-web whoami)" = app
+          docker compose exec -T ytdlp-web deno --version
+          docker compose exec -T ytdlp-web ffmpeg -hide_banner -version | head -1
+
+      - name: yt-dlp can update itself inside the container
+        run: |
+          for i in $(seq 1 90); do
+            docker compose logs | grep -q "yt-dlp is up to date" && exit 0
+            docker compose logs | grep -q "yt-dlp update failed" && break
+            sleep 2
+          done
+          exit 1
+
+      - name: Download a video and an MP3 through the API
+        run: python3 tests/e2e_docker.py http://127.0.0.1:8080 https://www.w3schools.com/html/mov_bbb.mp4
+
+      - name: Container logs
+        if: always()
+        run: docker compose logs
