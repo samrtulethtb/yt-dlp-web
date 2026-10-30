@@ -9,7 +9,9 @@ import json
 import logging
 import os
 import re
+import secrets
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -22,7 +24,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import quote, urlsplit
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 
@@ -40,7 +42,12 @@ def _env_flag(name: str, default: bool) -> bool:
 HOST               = os.environ.get("HOST", "127.0.0.1")
 PORT               = int(os.environ.get("PORT", 8080))
 MAX_SIZE_MB        = int(os.environ.get("MAX_SIZE_MB", 500))
+MAX_SIZE_BYTES     = MAX_SIZE_MB * 1_000_000   # MB as the page shows them
 COOKIES_FILE       = os.environ.get("COOKIES_FILE", "cookies.txt")
+# How many downloads run at the same time; the rest wait their turn.
+MAX_PARALLEL       = max(1, int(os.environ.get("MAX_PARALLEL_DOWNLOADS", 2)))
+# A download that takes longer than this is stopped.
+DOWNLOAD_TIMEOUT_MINUTES = int(os.environ.get("DOWNLOAD_TIMEOUT_MINUTES", 60))
 # Keep yt-dlp up to date: sites change often and old versions stop working.
 AUTO_UPDATE        = _env_flag("YTDLP_AUTO_UPDATE", True)
 UPDATE_EVERY_HOURS = 24
@@ -48,11 +55,15 @@ UPDATE_EVERY_HOURS = 24
 ALLOW_PRIVATE_URLS = _env_flag("ALLOW_PRIVATE_URLS", False)
 FRONTEND_DIR       = Path(__file__).parent / "frontend"
 
+INFO_TIMEOUT_SEC    = 120
+KEEP_FILES_MINUTES  = 30      # finished files stay this long, then are deleted
 MAX_URL_LENGTH      = 2048
 MAX_FILENAME_BYTES  = 200
-AUDIO_BITRATES      = {"128", "256", "320"}
-OUTPUT_EXTENSIONS   = {"mp4", "mp3"}
+MP3_QUALITIES       = {"0": "MP3 · best quality", "128": "MP3 · 128 kbps, smaller"}
+MP3_KBPS_ESTIMATE   = {"0": 245, "128": 128}   # "0" is LAME V0, about 245 kbps
+OUTPUT_EXTENSIONS   = {"mp4", "mp3", "m4a"}
 PARTIAL_SUFFIXES    = (".part", ".ytdl", ".temp", ".tmp")
+TEMP_PREFIX         = "yt-dlp-web-"
 
 log = logging.getLogger("yt-dlp-web")
 
@@ -64,7 +75,7 @@ class DownloadRequest(BaseModel):
     url: str
     format_id: str
     ext: str
-    audio_bitrate: Optional[str] = "320"
+    audio_bitrate: Optional[str] = "0"
     title: Optional[str] = None
 
 # ── yt-dlp ──────────────────────────────────────────────────────────────
@@ -86,7 +97,7 @@ def _ytdlp_base_args() -> list:
         args += ["--cookies", COOKIES_FILE]
     return args
 
-def _run(args: list, cwd: str = None, timeout_sec: int = 300):
+def _run(args: list, cwd: str = None, timeout_sec: int = INFO_TIMEOUT_SEC):
     try:
         result = subprocess.run(
             args,
@@ -99,7 +110,7 @@ def _run(args: list, cwd: str = None, timeout_sec: int = 300):
         )
         return result.returncode, result.stdout, result.stderr
     except subprocess.TimeoutExpired:
-        return -1, "", "ERROR: Download timed out"
+        return -1, "", "ERROR: The site took too long to answer"
 
 def _clean_error(stderr: str, fallback: str) -> str:
     """Return the last yt-dlp error line, short, without the 'ERROR:' prefix."""
@@ -157,12 +168,151 @@ def check_url(url: str) -> str:
         raise HTTPException(400, detail="Links to local or private network addresses are not allowed.")
     return url
 
+# ── Format list ─────────────────────────────────────────────────────────
+H264_CODECS = ("avc1", "avc3", "h264")
+CODEC_NAMES = {"vp09": "VP9", "vp9": "VP9", "av01": "AV1", "hev1": "HEVC", "hvc1": "HEVC", "vp8": "VP8"}
+
+def _has_video(f: dict) -> bool:
+    return f.get("vcodec") != "none" and f.get("ext") not in ("mhtml",)
+
+def _has_audio(f: dict) -> bool:
+    return f.get("acodec") not in ("none",)
+
+def _quality(f: dict) -> Optional[int]:
+    """The 'p' number people know: the short side, so a vertical
+    1080x1920 phone video counts as 1080p, not 1920p."""
+    width, height = f.get("width"), f.get("height")
+    if width and height:
+        return min(width, height)
+    return height
+
+def _is_h264(f: dict) -> bool:
+    return (f.get("vcodec") or "").lower().startswith(H264_CODECS)
+
+def _codec_name(f: dict) -> Optional[str]:
+    vcodec = (f.get("vcodec") or "").lower()
+    if not vcodec or vcodec.startswith(H264_CODECS):
+        return None
+    return CODEC_NAMES.get(vcodec.split(".", 1)[0])
+
+def _size(f: dict, duration) -> Optional[float]:
+    size = f.get("filesize") or f.get("filesize_approx")
+    if size:
+        return float(size)
+    if f.get("tbr") and duration:
+        return f["tbr"] * 1000 / 8 * duration
+    return None
+
+# Audio added to a video-only format, and the M4A choice: stereo M4A
+# first. It plays everywhere inside an MP4, while 5.1 and AC-3 tracks
+# make the file bigger and don't play on many phones.
+AUDIO_FOR_VIDEO = "bestaudio[ext=m4a][audio_channels<=?2]/bestaudio[ext=m4a]/bestaudio"
+
+def _audio_rank(f: dict):
+    channels = f.get("audio_channels")
+    return (
+        f.get("ext") == "m4a",
+        channels is None or channels <= 2,
+        (f.get("acodec") or "").startswith("mp4a"),
+        "DRC" not in (f.get("format_note") or ""),
+        f.get("language_preference") or 0,
+        f.get("abr") or f.get("tbr") or 0,
+    )
+
+def _best_audio(formats: list) -> Optional[dict]:
+    """The track yt-dlp picks for AUDIO_FOR_VIDEO, used for size estimates."""
+    audio = [f for f in formats if f.get("vcodec") == "none" and _has_audio(f)]
+    return max(audio, key=_audio_rank) if audio else None
+
+def _video_rank(f: dict):
+    # Plays everywhere > smoother > direct file (faster than HLS) > bitrate
+    direct = (f.get("protocol") or "").startswith("http")
+    return (_is_h264(f), f.get("fps") or 0, direct, f.get("tbr") or 0)
+
+def build_formats(data: dict) -> list:
+    """One video choice per quality plus the audio choices. Each choice
+    names the exact yt-dlp selector that is downloaded, so the size shown
+    is the size of the file the user gets."""
+    formats = [f for f in data.get("formats") or [] if not f.get("has_drm")]
+    duration = data.get("duration")
+    limit = MAX_SIZE_BYTES
+    audio = _best_audio(formats)
+    audio_size = _size(audio, duration) if audio else 0
+
+    best_by_quality = {}
+    for f in formats:
+        quality = _quality(f)
+        if not _has_video(f) or not quality or not f.get("format_id"):
+            continue
+        current = best_by_quality.get(quality)
+        if current is None or _video_rank(f) > _video_rank(current):
+            best_by_quality[quality] = f
+
+    choices = []
+    for quality in sorted(best_by_quality, reverse=True):
+        f = best_by_quality[quality]
+        fid = f["format_id"]
+        if _has_audio(f) and f.get("acodec"):
+            selector, size = fid, _size(f, duration)
+        else:
+            # Video-only: add the best audio; fall back to video alone if
+            # the site has no separate audio.
+            selector = "/".join(f"{fid}+{audio}" for audio in AUDIO_FOR_VIDEO.split("/")) + f"/{fid}"
+            video_size = _size(f, duration)
+            size = video_size + (audio_size or 0) if video_size else None
+        fps = f.get("fps") or 0
+        label = f"{quality}p" + (f"{round(fps)}" if fps > 30 else "")
+        if quality >= 2160:
+            label += " 4K"
+        choices.append({
+            "format_id": selector,
+            "label":     label,
+            "height":    quality,
+            "ext":       "mp4",
+            "type":      "video",
+            "codec":     _codec_name(f),
+            "filesize":  size,
+            "too_big":   bool(size and size > limit),
+        })
+
+    if not choices and (not formats or any(_has_video(f) for f in formats)):
+        # Some sites don't say which resolution they serve.
+        choices.append({
+            "format_id": "bv*+ba/b", "label": "Best quality", "height": None,
+            "ext": "mp4", "type": "video", "codec": None,
+            "filesize": None, "too_big": False,
+        })
+
+    for quality, label in MP3_QUALITIES.items():
+        size = MP3_KBPS_ESTIMATE[quality] * 1000 / 8 * duration if duration else None
+        choices.append({
+            "format_id":     "bestaudio/best",
+            "label":         label,
+            "ext":           "mp3",
+            "type":          "audio",
+            "audio_bitrate": quality,
+            "filesize":      size,
+            "too_big":       bool(size and size > limit),
+        })
+
+    if audio and audio.get("ext") == "m4a":
+        choices.append({
+            "format_id": AUDIO_FOR_VIDEO,
+            "label":     "M4A · original, no conversion",
+            "ext":       "m4a",
+            "type":      "audio",
+            "filesize":  audio_size,
+            "too_big":   bool(audio_size and audio_size > limit),
+        })
+
+    return choices
+
 # ── File names ──────────────────────────────────────────────────────────
 def _filename_char(ch: str) -> str:
     category = unicodedata.category(ch)
     if category == "Cc":       # tabs, line breaks and other control codes
         return " "
-    if category[0] == "C" and ch != "\u200d":  # keep the joiner inside emoji
+    if category[0] == "C" and ch != "‍":  # keep the joiner inside emoji
         return ""              # e.g. right-to-left override, unassigned
     return ch
 
@@ -196,16 +346,206 @@ def _pick_output_file(folder: str) -> Optional[Path]:
         return None
     return max(files, key=lambda p: p.stat().st_size)
 
+# ── Download jobs ───────────────────────────────────────────────────────
+# A download runs in the background. The page asks for its progress
+# every second and, when it is done, opens a normal file link, so the
+# browser saves the file itself (this works on phones and for big files).
+PROGRESS_PREFIX = "PROG "
+PROGRESS_TEMPLATE = (
+    "download:" + PROGRESS_PREFIX + "%(progress.downloaded_bytes)s %(progress.total_bytes)s "
+    "%(progress.total_bytes_estimate)s %(progress.speed)s %(progress.eta)s"
+)
+POSTPROCESS_STEPS = ("[Merger]", "[ExtractAudio]", "[VideoRemuxer]", "[VideoConvertor]", "[FixupM3u8]")
+
+jobs = {}
+jobs_lock = threading.Lock()
+download_slots = threading.Semaphore(MAX_PARALLEL)
+
+def _number(value: str) -> Optional[float]:
+    try:
+        number = float(value)
+    except ValueError:
+        return None  # yt-dlp prints "NA" when it doesn't know
+    return number if number >= 0 else None
+
+def _step_names(req: DownloadRequest) -> list:
+    if req.ext in ("mp3", "m4a"):
+        return ["Downloading audio"]
+    if "+" in req.format_id:
+        return ["Downloading video", "Downloading audio"]
+    return ["Downloading"]
+
+def _download_args(req: DownloadRequest, url: str, folder: str) -> list:
+    # %(title).150B keeps yt-dlp's own file name short enough for every OS.
+    output = os.path.join(folder, "%(title).150B.%(ext)s")
+    args = _ytdlp_base_args() + [
+        "--newline", "--progress-template", PROGRESS_TEMPLATE,
+        "--max-filesize", str(MAX_SIZE_BYTES),
+        "-o", output,
+    ]
+    if req.ext == "mp3":
+        quality = "0" if req.audio_bitrate == "0" else f"{req.audio_bitrate}K"
+        args += ["-f", "bestaudio/best", "--extract-audio",
+                 "--audio-format", "mp3", "--audio-quality", quality]
+    elif req.ext == "m4a":
+        # Keeps the original AAC track as it is; converts only if the
+        # site has no AAC audio.
+        args += ["-f", AUDIO_FOR_VIDEO, "--extract-audio", "--audio-format", "m4a"]
+    else:
+        args += ["-f", req.format_id, "--merge-output-format", "mp4"]
+    return args + ["--", url]
+
+def _update(job: dict, **changes) -> None:
+    with jobs_lock:
+        job.update(changes)
+
+def _stop_process(proc: subprocess.Popen) -> None:
+    """Stop yt-dlp and the ffmpeg it may have started."""
+    try:
+        if os.name == "posix":
+            os.killpg(proc.pid, signal.SIGKILL)
+        else:
+            proc.kill()
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+def _fail(job: dict, error: str) -> None:
+    shutil.rmtree(job["folder"], ignore_errors=True)
+    _update(job, status="error", error=error, finished=time.time())
+
+def _run_job(job: dict, req: DownloadRequest, url: str) -> None:
+    try:
+        _download(job, req, url)
+    except Exception:
+        log.exception("Download failed")
+        _fail(job, "Download failed. See the server log for details.")
+
+def _download(job: dict, req: DownloadRequest, url: str) -> None:
+    folder = job["folder"]
+    steps = _step_names(req)
+    with download_slots:
+        _update(job, status="downloading", step=steps[0], started=time.time())
+        popen_extra = {"start_new_session": True} if os.name == "posix" else {}
+        try:
+            proc = subprocess.Popen(
+                _download_args(req, url, folder),
+                cwd=folder,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                **popen_extra,
+            )
+        except OSError as exc:
+            _fail(job, f"Could not start yt-dlp: {exc}")
+            return
+
+        timer = threading.Timer(DOWNLOAD_TIMEOUT_MINUTES * 60, _stop_process, [proc])
+        timer.daemon = True
+        timer.start()
+        last_lines, part, too_big = [], -1, False
+        try:
+            for line in proc.stdout:
+                line = line.strip()
+                if line.startswith(PROGRESS_PREFIX):
+                    values = (line[len(PROGRESS_PREFIX):].split() + ["NA"] * 5)[:5]
+                    done, total, estimate, speed, eta = (_number(v) for v in values)
+                    total = total or estimate
+                    percent = min(100.0, done / total * 100) if done and total else None
+                    _update(job, downloaded=done, total=total, percent=percent, speed=speed, eta=eta)
+                    continue
+                last_lines = (last_lines + [line])[-30:]
+                if line.startswith("[download] Destination:"):
+                    part += 1
+                    _update(job, step=steps[min(part, len(steps) - 1)], percent=0,
+                            downloaded=None, total=None, speed=None, eta=None)
+                elif "larger than max-filesize" in line:
+                    too_big = True
+                elif line.startswith(POSTPROCESS_STEPS):
+                    _update(job, status="processing", step="Finishing the file",
+                            percent=None, downloaded=None, speed=None, eta=None)
+            code = proc.wait()
+        finally:
+            timer.cancel()
+            if proc.poll() is None:
+                _stop_process(proc)
+
+    elapsed = time.time() - job["started"]
+    out_file = _pick_output_file(folder)
+    error = None
+    if too_big:
+        error = f"This file is bigger than the {MAX_SIZE_MB} MB limit. Pick a lower quality."
+    elif code != 0 and elapsed >= DOWNLOAD_TIMEOUT_MINUTES * 60 - 1:
+        error = f"The download took longer than {DOWNLOAD_TIMEOUT_MINUTES} minutes and was stopped."
+    elif code != 0:
+        error = _clean_error("\n".join(last_lines), "Download failed")
+    elif out_file is None:
+        error = "yt-dlp finished but no file was made."
+    elif out_file.stat().st_size > MAX_SIZE_BYTES:
+        size_mb = out_file.stat().st_size / 1_000_000
+        error = f"File too large ({size_mb:.0f} MB). Limit is {MAX_SIZE_MB} MB."
+
+    if error:
+        _fail(job, error)
+        return
+
+    # Prefer the title the page showed; fall back to yt-dlp's file name.
+    ext = out_file.suffix.lstrip(".") or req.ext
+    title = req.title if req.title and req.title.strip() else out_file.stem
+    _update(job, status="done", step="Done", percent=100.0, speed=None, eta=None,
+            file=str(out_file), filename=safe_filename(title, ext),
+            size=out_file.stat().st_size, finished=time.time())
+
+def _public_job(job: dict) -> dict:
+    keys = ("id", "status", "step", "percent", "downloaded", "total", "speed", "eta",
+            "error", "filename", "size")
+    with jobs_lock:
+        return {key: job.get(key) for key in keys}
+
+def _get_job(job_id: str) -> dict:
+    with jobs_lock:
+        job = jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, detail="This download has expired. Please start it again.")
+    return job
+
+def _forget_job(job_id: str) -> None:
+    with jobs_lock:
+        job = jobs.pop(job_id, None)
+    if job:
+        shutil.rmtree(job["folder"], ignore_errors=True)
+
+def _cleanup_loop() -> None:
+    while True:
+        time.sleep(60)
+        cutoff = time.time() - KEEP_FILES_MINUTES * 60
+        with jobs_lock:
+            old = [jid for jid, job in jobs.items() if (job.get("finished") or time.time()) < cutoff]
+        for jid in old:
+            _forget_job(jid)
+
+def _remove_leftover_folders() -> None:
+    """Delete download folders left behind if the app was stopped mid-download."""
+    cutoff = time.time() - 600
+    for folder in Path(tempfile.gettempdir()).glob(TEMP_PREFIX + "*"):
+        try:
+            if folder.is_dir() and folder.stat().st_mtime < cutoff:
+                shutil.rmtree(folder, ignore_errors=True)
+        except OSError:
+            pass
+
+# ── Routes ──────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(_app):
     threading.Thread(target=_startup_checks, daemon=True).start()
+    threading.Thread(target=_cleanup_loop, name="cleanup", daemon=True).start()
     if AUTO_UPDATE:
         threading.Thread(target=_auto_update_loop, name="yt-dlp-update", daemon=True).start()
     yield
 
-app = FastAPI(title="yt-dlp Web", version="1.1.0", lifespan=lifespan)
+app = FastAPI(title="yt-dlp Web", version="1.2.0", lifespan=lifespan)
 
-# ── Routes ──────────────────────────────────────────────────────────────
 @app.get("/", response_class=HTMLResponse)
 async def index():
     page = FRONTEND_DIR / "index.html"
@@ -227,124 +567,53 @@ async def get_info(req: InfoRequest):
     except json.JSONDecodeError:
         raise HTTPException(400, detail="Invalid response from yt-dlp")
 
-    formats = []
-    seen = set()
-
-    for f in data.get("formats", []):
-        fid    = f.get("format_id", "")
-        vcodec = f.get("vcodec", "none")
-        acodec = f.get("acodec", "none")
-        height = f.get("height")
-        ext    = f.get("ext", "")
-
-        if vcodec == "none" or not height:
-            continue
-
-        label = f"{height}p {ext.upper()}"
-        if label in seen:
-            continue
-        seen.add(label)
-
-        format_id = fid if acodec != "none" else f"{fid}+bestaudio"
-
-        formats.append({
-            "format_id": format_id,
-            "label":     label,
-            "height":    height,
-            "ext":       "mp4",
-            "type":      "video",
-            "filesize":  f.get("filesize") or f.get("filesize_approx"),
-        })
-
-    formats.sort(key=lambda x: x.get("height", 0), reverse=True)
-
-    for bitrate, label in [("320", "MP3 320kbps"), ("256", "MP3 256kbps"), ("128", "MP3 128kbps")]:
-        formats.append({
-            "format_id":     "bestaudio/best",
-            "label":         label,
-            "ext":           "mp3",
-            "type":          "audio",
-            "audio_bitrate": bitrate,
-            "filesize":      None,
-        })
-
     return {
-        "title":     data.get("title", "Unknown"),
-        "uploader":  data.get("uploader", ""),
-        "duration":  data.get("duration"),
-        "thumbnail": data.get("thumbnail", ""),
-        "formats":   formats,
+        "title":       data.get("title", "Unknown"),
+        "uploader":    data.get("uploader", ""),
+        "duration":    data.get("duration"),
+        "thumbnail":   data.get("thumbnail", ""),
+        "max_size_mb": MAX_SIZE_MB,
+        "formats":     build_formats(data),
     }
 
-@app.post("/api/download")
-async def download(req: DownloadRequest, background_tasks: BackgroundTasks):
+@app.post("/api/download", status_code=202)
+async def download(req: DownloadRequest):
     url = await asyncio.to_thread(check_url, req.url)
     if req.ext not in OUTPUT_EXTENSIONS:
         raise HTTPException(400, detail="Unknown output format.")
-    audio_bitrate = req.audio_bitrate or "320"
-    if req.ext == "mp3" and audio_bitrate not in AUDIO_BITRATES:
-        raise HTTPException(400, detail="Unknown audio quality.")
+    if req.ext == "mp3":
+        # Older pages sent 256/320; those now get the best-quality MP3.
+        req.audio_bitrate = "128" if req.audio_bitrate == "128" else "0"
     format_id = (req.format_id or "").strip()
     if not format_id or len(format_id) > 200 or any(ord(ch) < 32 for ch in format_id):
         raise HTTPException(400, detail="Unknown video format.")
+    req.format_id = format_id
 
-    tmp_dir = tempfile.mkdtemp(prefix="yt-dlp-web-")
-    # %(title).150B keeps yt-dlp's own file name short enough for every OS.
-    output = os.path.join(tmp_dir, "%(title).150B.%(ext)s")
-    try:
-        if req.ext == "mp3":
-            args = _ytdlp_base_args() + [
-                "-f", "bestaudio/best",
-                "--extract-audio",
-                "--audio-format", "mp3",
-                "--audio-quality", f"{audio_bitrate}k",
-                "-o", output,
-                "--", url,
-            ]
-        else:
-            args = _ytdlp_base_args() + [
-                "-f", format_id,
-                "--merge-output-format", "mp4",
-                "-o", output,
-                "--", url,
-            ]
+    job_id = secrets.token_urlsafe(16)
+    job = {
+        "id": job_id, "status": "queued", "step": "Waiting for another download to finish",
+        "percent": None, "created": time.time(),
+        "folder": tempfile.mkdtemp(prefix=TEMP_PREFIX),
+    }
+    with jobs_lock:
+        jobs[job_id] = job
+    threading.Thread(target=_run_job, args=(job, req, url), name=f"job-{job_id[:6]}", daemon=True).start()
+    return {"job_id": job_id}
 
-        code, stdout, stderr = await asyncio.to_thread(_run, args, tmp_dir)
+@app.get("/api/jobs/{job_id}")
+async def job_status(job_id: str):
+    return _public_job(_get_job(job_id))
 
-        if code != 0:
-            raise HTTPException(400, detail=_clean_error(stderr, "Download failed"))
-
-        out_file = _pick_output_file(tmp_dir)
-        if out_file is None:
-            raise HTTPException(500, detail="No output file generated")
-
-        size_mb = out_file.stat().st_size / (1024 * 1024)
-        if size_mb > MAX_SIZE_MB:
-            raise HTTPException(
-                400,
-                detail=f"File too large ({size_mb:.0f} MB). Limit is {MAX_SIZE_MB} MB."
-            )
-
-        # Prefer the title the page showed; fall back to yt-dlp's file name.
-        ext = out_file.suffix.lstrip(".") or req.ext
-        title = req.title if req.title and req.title.strip() else out_file.stem
-        final_filename = safe_filename(title, ext)
-
-        background_tasks.add_task(shutil.rmtree, tmp_dir, True)
-
-        return FileResponse(
-            path=str(out_file),
-            media_type="application/octet-stream",
-            headers={"Content-Disposition": content_disposition(final_filename)},
-        )
-
-    except HTTPException:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise
-    except Exception:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        log.exception("Download failed")
-        raise HTTPException(500, detail="Download failed. See the server log for details.")
+@app.get("/api/jobs/{job_id}/file")
+async def job_file(job_id: str):
+    job = _get_job(job_id)
+    if job.get("status") != "done" or not job.get("file") or not os.path.isfile(job["file"]):
+        raise HTTPException(404, detail="This file is not ready or has expired.")
+    return FileResponse(
+        path=job["file"],
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": content_disposition(job["filename"])},
+    )
 
 @app.get("/api/health")
 async def health():
@@ -383,6 +652,7 @@ def _auto_update_loop() -> None:
         time.sleep(UPDATE_EVERY_HOURS * 3600)
 
 def _startup_checks() -> None:
+    _remove_leftover_folders()
     log.info("yt-dlp %s", _ytdlp_version())
     if not shutil.which("ffmpeg"):
         log.warning("ffmpeg was not found: merging video+audio and MP3 conversion will fail. See README.")
@@ -394,7 +664,6 @@ def _startup_checks() -> None:
             "Put it behind a password before exposing it to the internet (see README).",
             HOST, PORT,
         )
-
 
 if __name__ == "__main__":
     import uvicorn

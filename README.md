@@ -12,8 +12,10 @@ Download videos and audio from YouTube, TikTok, Instagram, Twitter, Reddit, and 
 
 ## Features
 
-- 🎬 **Video** — MP4 up to 4K, all available resolutions
-- 🎵 **Audio** — MP3 at 128 / 256 / 320 kbps
+- 🎬 **Video** — MP4 up to 4K, one clear choice per quality, picked to play on every device
+- 🎵 **Audio** — MP3 (best quality or smaller 128 kbps) or the original M4A without conversion
+- 📊 **Real progress** — percent, speed and time left while the server downloads
+- 📱 **Phone friendly** — files are saved by the browser itself, so big files work on phones too
 - 🔄 **Stays working** — updates yt-dlp by itself once a day, because sites change often
 - 🍪 **Cookie support** — age-restricted & member-only content
 - 🔒 **Private by default** — only your computer can open it until you choose otherwise
@@ -142,7 +144,9 @@ Set these as environment variables before starting the app (Docker: under `envir
 |----------------------|---------------|-------------|
 | `HOST`               | `127.0.0.1`   | Who can connect. `0.0.0.0` = every device that can reach this computer |
 | `PORT`               | `8080`        | HTTP port |
-| `MAX_SIZE_MB`        | `500`         | Largest file the app will send, in MB |
+| `MAX_SIZE_MB`        | `500`         | Largest file the app will download, in MB. Bigger choices are greyed out |
+| `MAX_PARALLEL_DOWNLOADS` | `2`       | Downloads that run at the same time; others wait their turn |
+| `DOWNLOAD_TIMEOUT_MINUTES` | `60`    | A download that takes longer is stopped |
 | `COOKIES_FILE`       | `cookies.txt` | Path to the cookies file |
 | `YTDLP_AUTO_UPDATE`  | `true`        | Update yt-dlp at start and every 24 hours |
 | `ALLOW_PRIVATE_URLS` | `false`       | Allow links to local network addresses (`192.168.x.x`, `localhost`…). Leave off on a public server |
@@ -152,6 +156,8 @@ Set these as environment variables before starting the app (Docker: under `envir
 PORT=9000 MAX_SIZE_MB=1000 python3 main.py
 ```
 
+Finished files are kept on the server for 30 minutes, so the download can be retried, then deleted.
+
 ---
 
 ## Troubleshooting
@@ -159,6 +165,8 @@ PORT=9000 MAX_SIZE_MB=1000 python3 main.py
 - **YouTube shows only a few qualities, or none.** YouTube needs Deno (or Node.js 20+). Open `http://localhost:8080/api/health`: `js_runtime` should say `deno` or `node`. Install Deno (see Quick Start) and restart the app.
 - **"Sign in to confirm you're not a bot".** YouTube is blocking your IP address for a while. Add `cookies.txt` (see above) or try again later.
 - **MP3 or high qualities fail with an ffmpeg error.** ffmpeg is missing or your terminal doesn't see it yet. Install it and reopen the terminal.
+- **A quality is greyed out.** It is bigger than `MAX_SIZE_MB` (500 MB by default). Raise the limit or pick a lower quality.
+- **A quality says VP9 or AV1.** At that quality the site only offers newer video formats. They look great but may not play on older phones and TVs; qualities without a label use H.264, which plays everywhere.
 - **A site stopped working.** Wait for the daily yt-dlp update or restart the app to update now. If it still fails, the site may not be supported by yt-dlp yet.
 
 ---

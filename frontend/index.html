@@ -282,6 +282,27 @@ input[type="text"]::placeholder { color: var(--muted); }
 .btn-dl:active { transform: scale(0.98); }
 .btn-dl:disabled { opacity: 0.35; cursor: not-allowed; }
 
+.fmt-btn:disabled,
+.fmt-btn:disabled:hover {
+  opacity: 0.4;
+  cursor: not-allowed;
+  border-color: var(--border2);
+  color: var(--muted);
+}
+.fmt-note {
+  font-size: 0.72rem;
+  color: var(--muted);
+  line-height: 1.5;
+}
+.fmt-note:empty { display: none; }
+.save-link {
+  display: inline-block;
+  margin-top: 0.5rem;
+  font-size: 0.8rem;
+  color: var(--accent2);
+}
+.progress-fill.unknown { width: 100% !important; opacity: 0.45; }
+
 /* Progress bar */
 #progressWrap {
   display: none;
@@ -384,18 +405,21 @@ footer a { color: var(--accent2); text-decoration: none; }
       </div>
 
       <div class="fmt-section">
-        <div class="fmt-label">📺 Video (MP4)</div>
+        <div class="fmt-label">📺 Video</div>
         <div class="fmt-grid" id="videoFormats"></div>
       </div>
 
       <div class="fmt-section">
-        <div class="fmt-label">🎵 Audio (MP3)</div>
+        <div class="fmt-label">🎵 Audio</div>
         <div class="fmt-grid" id="audioFormats"></div>
       </div>
+
+      <div class="fmt-note" id="fmtNote"></div>
 
       <div id="progressWrap">
         <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
         <div class="status" id="dlStatus"></div>
+        <a class="save-link" id="saveLink" href="#" download hidden>Download didn't start? Save the file</a>
       </div>
 
       <button class="btn-dl" id="dlBtn" onclick="startDownload()" disabled>
@@ -429,13 +453,15 @@ footer a { color: var(--accent2); text-decoration: none; }
 <script>
 let selectedFormat = null;
 let currentTitle = '';
+let currentUrl = '';
+let busy = false;
 
 // Messages can contain text from other websites, so they are always
 // shown as plain text, never as HTML.
-function showStatus(el, msg, type = '', busy = false) {
+function showStatus(el, msg, type = '', spinning = false) {
   el.className = 'status ' + type;
   el.textContent = '';
-  if (busy) {
+  if (spinning) {
     const spinner = document.createElement('div');
     spinner.className = 'spinner';
     el.appendChild(spinner);
@@ -444,42 +470,45 @@ function showStatus(el, msg, type = '', busy = false) {
   el.appendChild(document.createTextNode(msg));
 }
 
-function setStatus(msg, type = '', busy = false) {
-  showStatus(document.getElementById('status'), msg, type, busy);
+function setStatus(msg, type = '', spinning = false) {
+  showStatus(document.getElementById('status'), msg, type, spinning);
 }
 
-// Prefer the full UTF-8 name (filename*=UTF-8''...) so titles with
-// accents, other alphabets or emoji keep their real name.
-function filenameFrom(disposition, fallback) {
-  const utf8 = disposition.match(/filename\*=UTF-8''([^;]+)/i);
-  if (utf8) {
-    try { return decodeURIComponent(utf8[1].trim()); } catch (e) { /* use the plain name */ }
-  }
-  const plain = disposition.match(/filename="([^"]+)"/i) || disposition.match(/filename=([^;]+)/i);
-  return plain ? plain[1].trim() : fallback;
+function setDlStatus(msg, type = '', spinning = false) {
+  showStatus(document.getElementById('dlStatus'), msg, type, spinning);
 }
 
 function formatDuration(sec) {
-  if (!sec) return '';
-  const m = Math.floor(sec / 60), s = sec % 60;
-  return `${m}:${s.toString().padStart(2,'0')}`;
+  if (!sec && sec !== 0) return '';
+  sec = Math.round(sec);
+  const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60;
+  const mm = h ? String(m).padStart(2, '0') : m;
+  return (h ? h + ':' : '') + mm + ':' + String(s).padStart(2, '0');
 }
 
 function formatSize(bytes) {
   if (!bytes) return '';
-  if (bytes > 1e9) return (bytes/1e9).toFixed(1) + ' GB';
-  if (bytes > 1e6) return (bytes/1e6).toFixed(0) + ' MB';
-  return (bytes/1e3).toFixed(0) + ' KB';
+  if (bytes >= 1e9) return (bytes / 1e9).toFixed(1) + ' GB';
+  if (bytes >= 1e6) return (bytes / 1e6).toFixed(0) + ' MB';
+  return (bytes / 1e3).toFixed(0) + ' KB';
+}
+
+function setProgress(percent) {
+  const fill = document.getElementById('progressFill');
+  fill.classList.toggle('unknown', percent === null || percent === undefined);
+  fill.style.width = (percent || 0) + '%';
 }
 
 async function fetchInfo() {
+  if (busy) return;
   const url = document.getElementById('urlInput').value.trim();
-  if (!url) { setStatus('Paste a URL first.', 'error'); return; }
+  if (!url) { setStatus('Paste a link first.', 'error'); return; }
 
   // Reset
   document.getElementById('infoBox').style.display = 'none';
   document.getElementById('dlBtn').disabled = true;
   document.getElementById('progressWrap').style.display = 'none';
+  document.getElementById('saveLink').hidden = true;
   selectedFormat = null;
 
   document.getElementById('fetchBtn').disabled = true;
@@ -488,7 +517,7 @@ async function fetchInfo() {
   try {
     const res = await fetch('/api/info', {
       method: 'POST',
-      headers: {'Content-Type':'application/json'},
+      headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({url})
     });
     const data = await res.json().catch(() => ({}));
@@ -498,33 +527,45 @@ async function fetchInfo() {
       return;
     }
 
-    // Populate info
-    document.getElementById('thumb').src = data.thumbnail || '';
+    currentUrl = url;
     currentTitle = data.title || '';
+    document.getElementById('thumb').src = data.thumbnail || '';
     document.getElementById('videoTitle').textContent = data.title;
     document.getElementById('videoMeta').textContent =
       [data.uploader, formatDuration(data.duration)].filter(Boolean).join(' · ');
 
-    // Video formats
     const vGrid = document.getElementById('videoFormats');
     vGrid.innerHTML = '';
     const audioGrid = document.getElementById('audioFormats');
     audioGrid.innerHTML = '';
+    const notes = new Set();
 
     data.formats.forEach(f => {
       const btn = document.createElement('button');
       btn.className = 'fmt-btn' + (f.type === 'audio' ? ' audio' : '');
       btn.textContent = f.label;
-      if (f.filesize) {
-        const size = document.createElement('span');
-        size.className = 'filesize';
-        size.textContent = formatSize(f.filesize);
-        btn.appendChild(size);
+      const extra = [];
+      if (f.filesize) extra.push((f.type === 'audio' && f.ext === 'mp3' ? '~' : '') + formatSize(f.filesize));
+      if (f.codec) {
+        extra.push(f.codec);
+        notes.add(`${f.codec} gives the best picture at this quality but may not play on older phones and TVs. Pick a quality without a label for the widest support.`);
+      }
+      if (extra.length) {
+        const small = document.createElement('span');
+        small.className = 'filesize';
+        small.textContent = extra.join(' · ');
+        btn.appendChild(small);
+      }
+      if (f.too_big) {
+        btn.disabled = true;
+        btn.title = `Bigger than the ${data.max_size_mb} MB limit`;
+        notes.add(`Greyed-out choices are bigger than this server's ${data.max_size_mb} MB limit.`);
       }
       btn.onclick = () => selectFormat(f, btn);
       if (f.type === 'video') vGrid.appendChild(btn);
       else audioGrid.appendChild(btn);
     });
+    document.getElementById('fmtNote').textContent = [...notes].join(' ');
 
     document.getElementById('infoBox').style.display = 'block';
     setStatus('✓ Ready — select a format', 'ok');
@@ -537,74 +578,98 @@ async function fetchInfo() {
 }
 
 function selectFormat(f, btn) {
-  // Deselect all
+  if (busy) return;
   document.querySelectorAll('.fmt-btn').forEach(b => b.classList.remove('selected'));
   btn.classList.add('selected');
   selectedFormat = f;
-  document.getElementById('dlBtn').disabled = false;
-  document.getElementById('dlBtn').textContent = `⬇ Download — ${f.label}`;
+  const dlBtn = document.getElementById('dlBtn');
+  dlBtn.disabled = false;
+  dlBtn.textContent = `⬇ Download — ${f.label}`;
+}
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+function progressText(job) {
+  const parts = [job.step || 'Working'];
+  if (job.percent !== null && job.percent !== undefined && job.status === 'downloading') {
+    parts[0] += ' ' + Math.floor(job.percent) + '%';
+  } else if (job.downloaded) {
+    parts.push(formatSize(job.downloaded));
+  }
+  if (job.speed) parts.push(formatSize(job.speed) + '/s');
+  if (job.eta) parts.push(formatDuration(job.eta) + ' left');
+  return parts.join(' · ') + '…';
+}
+
+// Ask the server how the download is going until it is done.
+async function waitForJob(jobId) {
+  let failures = 0;
+  while (true) {
+    await sleep(1000);
+    let res, job;
+    try {
+      res = await fetch(`/api/jobs/${jobId}`, {cache: 'no-store'});
+      job = await res.json().catch(() => ({}));
+    } catch (e) {
+      if (++failures >= 10) throw new Error('Lost the connection to the server.');
+      continue;
+    }
+    failures = 0;
+    if (!res.ok) throw new Error(job.detail || 'The download was lost. Please try again.');
+    if (job.status === 'error') throw new Error(job.error || 'Download failed');
+    if (job.status === 'done') return job;
+    setProgress(job.status === 'downloading' ? job.percent : null);
+    setDlStatus(progressText(job), '', true);
+  }
 }
 
 async function startDownload() {
-  if (!selectedFormat) return;
-
-  const url = document.getElementById('urlInput').value.trim();
+  if (!selectedFormat || busy) return;
+  busy = true;
+  const format = selectedFormat;
   const btn = document.getElementById('dlBtn');
+  const saveLink = document.getElementById('saveLink');
   btn.disabled = true;
-  btn.textContent = '⏳ Preparing…';
+  btn.textContent = '⏳ Working…';
+  saveLink.hidden = true;
 
-  const pw = document.getElementById('progressWrap');
-  pw.style.display = 'block';
-  document.getElementById('progressFill').style.width = '30%';
-  showStatus(document.getElementById('dlStatus'), 'Downloading…', '', true);
+  document.getElementById('progressWrap').style.display = 'block';
+  setProgress(null);
+  setDlStatus('Starting…', '', true);
 
   try {
     const res = await fetch('/api/download', {
       method: 'POST',
-      headers: {'Content-Type':'application/json'},
+      headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({
-        url,
-        format_id:     selectedFormat.format_id,
-        ext:           selectedFormat.ext,
-        audio_bitrate: selectedFormat.audio_bitrate || '320',
+        url:           currentUrl,
+        format_id:     format.format_id,
+        ext:           format.ext,
+        audio_bitrate: format.audio_bitrate || '0',
         title:         currentTitle,
       })
     });
+    const started = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(started.detail || 'Download failed');
 
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      document.getElementById('dlStatus').textContent = '✗ ' + (err.detail || 'Download failed');
-      document.getElementById('dlStatus').className = 'status error';
-      document.getElementById('progressFill').style.width = '0%';
-      btn.disabled = false;
-      btn.textContent = `⬇ Download — ${selectedFormat.label}`;
-      return;
-    }
+    const job = await waitForJob(started.job_id);
 
-    document.getElementById('progressFill').style.width = '100%';
-    document.getElementById('dlStatus').textContent = '✓ Done! Saving file…';
-    document.getElementById('dlStatus').className = 'status ok';
-
-    // Trigger browser download
-    const blob = await res.blob();
-    const disposition = res.headers.get('content-disposition') || '';
-    const filename = filenameFrom(disposition, `download.${selectedFormat.ext}`);
-
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    // Give the browser time to start saving before the blob is released.
-    setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+    // A normal link lets the browser save the file itself: no size limit,
+    // works on phones. The visible link is a backup if the browser blocks
+    // the automatic download.
+    setProgress(100);
+    setDlStatus(`✓ Done (${formatSize(job.size)}). Saving ${job.filename}`, 'ok');
+    saveLink.href = `/api/jobs/${encodeURIComponent(job.id)}/file`;
+    saveLink.hidden = false;
+    saveLink.click();
 
   } catch (e) {
-    document.getElementById('dlStatus').textContent = '✗ ' + e.message;
-    document.getElementById('dlStatus').className = 'status error';
+    setProgress(0);
+    setDlStatus('✗ ' + e.message, 'error');
   } finally {
+    busy = false;
     btn.disabled = false;
-    btn.textContent = `⬇ Download — ${selectedFormat.label}`;
+    btn.textContent = `⬇ Download — ${format.label}`;
   }
 }
 

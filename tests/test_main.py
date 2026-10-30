@@ -1,6 +1,7 @@
 """Tests for the safety checks and file naming. No network needed."""
 
 import socket
+from pathlib import Path
 from urllib.parse import unquote
 
 import pytest
@@ -33,6 +34,8 @@ def client(monkeypatch):
     monkeypatch.setattr(main, "_startup_checks", lambda: None)
     with TestClient(main.app) as c:
         yield c
+    for job_id in list(main.jobs):
+        main._forget_job(job_id)
 
 
 @pytest.mark.parametrize("url", [
@@ -106,12 +109,12 @@ def test_option_like_url_never_reaches_ytdlp(client, monkeypatch):
 
 @pytest.mark.parametrize("payload", [
     {"ext": "exe"},
-    {"ext": "mp3", "audio_bitrate": "999"},
     {"format_id": ""},
     {"format_id": "x" * 500},
+    {"url": "--version"},
 ])
 def test_download_rejects_bad_options(client, monkeypatch, payload):
-    monkeypatch.setattr(main, "_run", lambda *a, **k: pytest.fail("yt-dlp must not run"))
+    monkeypatch.setattr(main, "_run_job", lambda *a, **k: pytest.fail("no job may start"))
     body = {"url": "https://example.com/v", "format_id": "18", "ext": "mp4"}
     body.update(payload)
     assert client.post("/api/download", json=body).status_code == 400
@@ -163,3 +166,216 @@ def test_partial_files_are_never_picked(tmp_path):
     (tmp_path / "video.mp4.part").write_bytes(b"x" * 100)
     (tmp_path / "video.mp4").write_bytes(b"x" * 10)
     assert main._pick_output_file(str(tmp_path)).name == "video.mp4"
+
+
+# ── Format list ─────────────────────────────────────────────────────────
+def fmt(fid, **kw):
+    base = {"format_id": fid, "vcodec": "avc1.64001F", "acodec": "none", "ext": "mp4",
+            "protocol": "https"}
+    base.update(kw)
+    return base
+
+
+def test_one_choice_per_quality_preferring_h264():
+    data = {"duration": 100, "formats": [
+        fmt("vp9-1080", vcodec="vp09.00.40.08", width=1920, height=1080, tbr=3000, ext="webm"),
+        fmt("avc-1080", width=1920, height=1080, tbr=2500, filesize=30_000_000),
+        fmt("av1-2160", vcodec="av01.0.12M.08", width=3840, height=2160, tbr=9000),
+        fmt("aac", vcodec="none", acodec="mp4a.40.2", ext="m4a", abr=128, filesize=1_600_000),
+        fmt("opus", vcodec="none", acodec="opus", ext="webm", abr=160),
+    ]}
+    video = [c for c in main.build_formats(data) if c["type"] == "video"]
+    assert [c["label"] for c in video] == ["2160p 4K", "1080p"]
+    assert video[1]["format_id"].startswith("avc-1080+bestaudio[ext=m4a][audio_channels<=?2]/")
+    assert video[1]["format_id"].endswith("/avc-1080")
+    assert video[1]["codec"] is None and video[0]["codec"] == "AV1"
+    assert video[1]["filesize"] == 31_600_000
+
+
+def test_vertical_videos_use_the_short_side():
+    data = {"formats": [fmt("v", width=1080, height=1920, acodec="aac")]}
+    video = [c for c in main.build_formats(data) if c["type"] == "video"]
+    assert video[0]["label"] == "1080p" and video[0]["format_id"] == "v"
+
+
+def test_direct_file_beats_hls_at_the_same_quality():
+    data = {"formats": [
+        fmt("hls-720", width=1280, height=720, protocol="m3u8_native", tbr=2000, acodec="aac"),
+        fmt("http-720", width=1280, height=720, protocol="https", tbr=1900, acodec="aac"),
+    ]}
+    assert main.build_formats(data)[0]["format_id"] == "http-720"
+
+
+def test_sixty_fps_is_shown():
+    data = {"formats": [fmt("a", width=1920, height=1080, fps=60, acodec="aac")]}
+    assert main.build_formats(data)[0]["label"] == "1080p60"
+
+
+def test_too_big_choices_are_marked(monkeypatch):
+    monkeypatch.setattr(main, "MAX_SIZE_BYTES", 10_000_000)
+    data = {"duration": 60, "formats": [
+        fmt("big", width=1920, height=1080, filesize=10_000_001, acodec="aac"),
+        fmt("small", width=640, height=360, filesize=10_000_000, acodec="aac"),
+    ]}
+    flags = {c["label"]: c["too_big"] for c in main.build_formats(data)}
+    assert flags["1080p"] is True and flags["360p"] is False
+
+
+def test_site_without_resolutions_gets_best_quality():
+    data = {"formats": [{"format_id": "0", "ext": "mp4", "url": "https://x/v.mp4"}]}
+    video = [c for c in main.build_formats(data) if c["type"] == "video"]
+    assert video == [dict(video[0], label="Best quality", format_id="bv*+ba/b")]
+
+
+def test_audio_choices_are_honest():
+    data = {"duration": 200, "formats": [
+        fmt("aac", vcodec="none", acodec="mp4a.40.2", ext="m4a", abr=128, filesize=3_200_000),
+    ]}
+    audio = [c for c in main.build_formats(data) if c["type"] == "audio"]
+    assert [c["label"] for c in audio] == [
+        "MP3 · best quality", "MP3 · 128 kbps, smaller", "M4A · original, no conversion"]
+    assert audio[1]["filesize"] == 128 * 1000 / 8 * 200
+    assert audio[2]["filesize"] == 3_200_000
+
+
+def test_no_m4a_choice_without_an_m4a_track():
+    data = {"formats": [fmt("opus", vcodec="none", acodec="opus", ext="webm", abr=160)]}
+    labels = [c["label"] for c in main.build_formats(data)]
+    assert not any(label.startswith("M4A") for label in labels)
+
+
+def test_old_mp3_bitrates_become_best_quality(client, monkeypatch):
+    seen = []
+    monkeypatch.setattr(main, "_run_job", lambda job, req, url: seen.append(req.audio_bitrate))
+    body = {"url": "https://example.com/v", "format_id": "bestaudio/best", "ext": "mp3"}
+    for bitrate in ("320", "256", "128"):
+        assert client.post("/api/download", json=dict(body, audio_bitrate=bitrate)).status_code == 202
+    assert seen == ["0", "0", "128"]
+
+
+# ── Download jobs (with a fake yt-dlp) ─────────────────────────────────
+FAKE_YTDLP = r"""
+import os, sys, time
+mode = sys.argv[1]
+print("[youtube] abc: Downloading webpage", flush=True)
+if mode == "fail":
+    print("ERROR: [youtube] abc: Video unavailable", flush=True)
+    sys.exit(1)
+if mode == "slow":
+    time.sleep(30)
+if mode == "too-big":
+    print("[download] File is larger than max-filesize (9 bytes > 1 bytes). Aborting.", flush=True)
+    sys.exit(0)
+print("[download] Destination: Clip.f1.mp4", flush=True)
+for done in (100, 500, 1000):
+    print(f"PROG {done} 1000 NA 2048.5 3", flush=True)
+    time.sleep(0.05)
+print("[download] Destination: Clip.f2.m4a", flush=True)
+print("PROG 10 NA 40 NA NA", flush=True)
+print('[Merger] Merging formats into "Clip.mp4"', flush=True)
+open("Clip.mp4", "wb").write(b"x" * 1234)
+open("Clip.f1.mp4.part", "wb").write(b"x")
+"""
+
+
+@pytest.fixture
+def fake_ytdlp(monkeypatch, tmp_path):
+    script = tmp_path / "fake_ytdlp.py"
+    script.write_text(FAKE_YTDLP)
+    mode = {"value": "ok"}
+    monkeypatch.setattr(main, "_download_args",
+                        lambda req, url, folder: [main.sys.executable, str(script), mode["value"]])
+    return mode
+
+
+def wait_for(client, job_id, timeout=10):
+    import time
+    end = time.time() + timeout
+    while time.time() < end:
+        job = client.get(f"/api/jobs/{job_id}").json()
+        if job["status"] in ("done", "error"):
+            return job
+        time.sleep(0.05)
+    pytest.fail("job did not finish")
+
+
+def start(client, **extra):
+    body = {"url": "https://example.com/v", "format_id": "1+bestaudio", "ext": "mp4",
+            "title": "My clip"}
+    body.update(extra)
+    res = client.post("/api/download", json=body)
+    assert res.status_code == 202
+    return res.json()["job_id"]
+
+
+def test_job_reports_progress_and_serves_the_file(client, fake_ytdlp):
+    job_id = start(client)
+    job = wait_for(client, job_id)
+    assert job["status"] == "done" and job["percent"] == 100
+    assert job["filename"] == "My clip.mp4" and job["size"] == 1234
+    assert "folder" not in job and "file" not in job
+    res = client.get(f"/api/jobs/{job_id}/file")
+    assert res.status_code == 200 and len(res.content) == 1234
+    assert "My%20clip.mp4" in res.headers["content-disposition"]
+
+
+def test_job_error_message_comes_from_ytdlp(client, fake_ytdlp):
+    fake_ytdlp["value"] = "fail"
+    job = wait_for(client, start(client))
+    assert job["status"] == "error"
+    assert job["error"] == "[youtube] abc: Video unavailable"
+
+
+def test_job_too_big_is_explained(client, fake_ytdlp):
+    fake_ytdlp["value"] = "too-big"
+    job = wait_for(client, start(client))
+    assert job["status"] == "error" and "MB limit" in job["error"]
+
+
+def test_unknown_or_unfinished_jobs_have_no_file(client, fake_ytdlp):
+    assert client.get("/api/jobs/nope").status_code == 404
+    assert client.get("/api/jobs/nope/file").status_code == 404
+
+
+def test_expired_jobs_are_deleted_with_their_files(client, fake_ytdlp):
+    job_id = start(client)
+    wait_for(client, job_id)
+    folder = main.jobs[job_id]["folder"]
+    main._forget_job(job_id)
+    assert client.get(f"/api/jobs/{job_id}").status_code == 404
+    assert not Path(folder).exists()
+
+
+def test_progress_line_parsing():
+    assert main._number("NA") is None
+    assert main._number("12.5") == 12.5
+
+
+def test_download_args_put_the_link_last_after_double_dash():
+    req = main.DownloadRequest(url="https://example.com/v", format_id="18", ext="mp4")
+    args = main._download_args(req, "https://example.com/v", "/tmp/x")
+    assert args[-2:] == ["--", "https://example.com/v"]
+    assert args[args.index("--max-filesize") + 1] == str(main.MAX_SIZE_MB * 1_000_000)
+
+
+def test_stereo_aac_is_preferred_over_surround_tracks():
+    data = {"duration": 100, "formats": [
+        fmt("v", width=426, height=240, filesize=1_000_000),
+        fmt("258", vcodec="none", acodec="mp4a.40.2", ext="m4a", audio_channels=6, abr=388, filesize=5_000_000),
+        fmt("380", vcodec="none", acodec="ac-3", ext="m4a", audio_channels=6, abr=384, filesize=5_000_000),
+        fmt("140-drc", vcodec="none", acodec="mp4a.40.2", ext="m4a", audio_channels=2, abr=129,
+            filesize=1_600_000, format_note="medium, DRC"),
+        fmt("140", vcodec="none", acodec="mp4a.40.2", ext="m4a", audio_channels=2, abr=129, filesize=1_600_000),
+    ]}
+    assert main._best_audio(data["formats"])["format_id"] == "140"
+    assert main.build_formats(data)[0]["filesize"] == 2_600_000
+
+
+def test_slow_downloads_are_stopped(client, fake_ytdlp, monkeypatch):
+    import time
+    monkeypatch.setattr(main, "DOWNLOAD_TIMEOUT_MINUTES", 0.01)  # 0.6 seconds
+    fake_ytdlp["value"] = "slow"
+    started = time.time()
+    job = wait_for(client, start(client), timeout=10)
+    assert job["status"] == "error" and "longer than" in job["error"]
+    assert time.time() - started < 10
