@@ -8,6 +8,11 @@ services:
       - "127.0.0.1:8080:8080"
     environment:
       - MAX_SIZE_MB=500
+      # Before opening it to other people, read "Putting it on the internet"
+      # in the README and uncomment what you need:
+      # - ACCESS_PASSWORD=pick-a-long-password
+      # - PUBLIC_MODE=true
+      # - FORWARDED_ALLOW_IPS=*
     # Optional: log-in cookies for age-restricted or members-only videos.
     # Create cookies.txt first (see README), then uncomment these two lines.
     # volumes:

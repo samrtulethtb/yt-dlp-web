@@ -28,11 +28,23 @@ def fake_dns(monkeypatch):
     monkeypatch.setattr(main, "ALLOW_PRIVATE_URLS", False)
 
 
+BROWSER = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/130.0 Safari/537.36"
+
+
+@pytest.fixture(autouse=True)
+def default_access(monkeypatch):
+    monkeypatch.setattr(main, "ACCESS_PASSWORD", "")
+    monkeypatch.setattr(main, "PUBLIC_MODE", False)
+    for store in (main.lookups, main.daily_downloads, main.failed_logins):
+        store.clear()
+
+
 @pytest.fixture
 def client(monkeypatch):
     monkeypatch.setattr(main, "AUTO_UPDATE", False)
     monkeypatch.setattr(main, "_startup_checks", lambda: None)
-    with TestClient(main.app) as c:
+    headers = {"X-Requested-With": "yt-dlp-web", "User-Agent": BROWSER}
+    with TestClient(main.app, headers=headers) as c:
         yield c
     for job_id in list(main.jobs):
         main._forget_job(job_id)
@@ -379,3 +391,117 @@ def test_slow_downloads_are_stopped(client, fake_ytdlp, monkeypatch):
     job = wait_for(client, start(client), timeout=10)
     assert job["status"] == "error" and "longer than" in job["error"]
     assert time.time() - started < 10
+
+
+
+# ── Access and public mode ─────────────────────────────────────────────
+import base64
+from types import SimpleNamespace
+
+
+def basic(password, user="me"):
+    return "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode()
+
+
+def test_api_needs_the_page_header(client):
+    res = client.post("/api/info", json={"url": "https://example.com/v"},
+                      headers={"X-Requested-With": ""})
+    assert res.status_code == 403
+
+
+def test_page_and_health_need_no_header(client, monkeypatch):
+    monkeypatch.setattr(main, "_ytdlp_version", lambda: "test")
+    assert client.get("/", headers={"X-Requested-With": ""}).status_code == 200
+    assert client.get("/api/health", headers={"X-Requested-With": ""}).status_code == 200
+
+
+def test_password_protects_everything_but_health(client, monkeypatch):
+    monkeypatch.setattr(main, "ACCESS_PASSWORD", "s3cret é")
+    monkeypatch.setattr(main, "_ytdlp_version", lambda: "test")
+    res = client.get("/")
+    assert res.status_code == 401 and res.headers["www-authenticate"].startswith("Basic")
+    assert client.get("/", headers={"Authorization": basic("wrong")}).status_code == 401
+    assert client.get("/", headers={"Authorization": basic("s3cret é", user="anyone")}).status_code == 200
+    assert client.get("/api/jobs/x/file").status_code == 401
+    assert client.get("/api/health").status_code == 200
+
+
+def test_too_many_wrong_passwords_are_slowed_down(client, monkeypatch):
+    monkeypatch.setattr(main, "ACCESS_PASSWORD", "right")
+    for _ in range(main.FAILED_LOGINS_ALLOWED):
+        assert client.get("/", headers={"Authorization": basic("wrong")}).status_code == 401
+    assert client.get("/", headers={"Authorization": basic("right")}).status_code == 429
+
+
+@pytest.mark.parametrize("agent", ["curl/8.5.0", "python-requests/2.32", "Wget/1.21", "", "Go-http-client/2.0",
+                                   "Mozilla/5.0 HeadlessChrome/130.0"])
+def test_public_mode_refuses_scripts(client, monkeypatch, agent):
+    monkeypatch.setattr(main, "PUBLIC_MODE", True)
+    res = client.post("/api/info", json={"url": "https://example.com/v"}, headers={"User-Agent": agent})
+    assert res.status_code == 403 and "browser" in res.json()["detail"]
+
+
+def test_scripts_are_fine_without_public_mode(client, monkeypatch):
+    monkeypatch.setattr(main, "_run", lambda *a, **k: (1, "", "ERROR: nope"))
+    res = client.post("/api/info", json={"url": "https://example.com/v"}, headers={"User-Agent": "curl/8"})
+    assert res.status_code == 400
+
+
+def test_public_mode_limits_lookups(client, monkeypatch):
+    monkeypatch.setattr(main, "PUBLIC_MODE", True)
+    monkeypatch.setattr(main, "_run", lambda *a, **k: (1, "", "ERROR: nope"))
+    for _ in range(main.PUBLIC_LOOKUPS):
+        assert client.post("/api/info", json={"url": "https://example.com/v"}).status_code == 400
+    assert client.post("/api/info", json={"url": "https://example.com/v"}).status_code == 429
+
+
+def test_public_mode_daily_limit_and_refund(client, fake_ytdlp, monkeypatch):
+    monkeypatch.setattr(main, "PUBLIC_MODE", True)
+    monkeypatch.setattr(main, "DOWNLOADS_PER_DAY", 2)
+    fake_ytdlp["value"] = "fail"
+    wait_for(client, start(client))            # failed: not counted
+    fake_ytdlp["value"] = "ok"
+    wait_for(client, start(client))
+    wait_for(client, start(client))
+    body = {"url": "https://example.com/v", "format_id": "18", "ext": "mp4"}
+    res = client.post("/api/download", json=body)
+    assert res.status_code == 429 and "today's limit of 2" in res.json()["detail"]
+    assert main.downloads_left("testclient") == 0
+
+
+def test_public_mode_limits_downloads_at_once(client, fake_ytdlp, monkeypatch):
+    monkeypatch.setattr(main, "PUBLIC_MODE", True)
+    monkeypatch.setattr(main, "DOWNLOAD_TIMEOUT_MINUTES", 0.05)  # stops the slow fakes after 3 s
+    fake_ytdlp["value"] = "slow"
+    job_ids = [start(client) for _ in range(main.PUBLIC_ACTIVE_PER_VISITOR)]
+    body = {"url": "https://example.com/v", "format_id": "18", "ext": "mp4"}
+    res = client.post("/api/download", json=body)
+    assert res.status_code == 429 and "already have" in res.json()["detail"]
+    for job_id in job_ids:
+        assert wait_for(client, job_id)["status"] == "error"
+
+
+def test_low_disk_space_refuses_downloads(client, monkeypatch):
+    monkeypatch.setattr(main.shutil, "disk_usage", lambda path: SimpleNamespace(free=10))
+    body = {"url": "https://example.com/v", "format_id": "18", "ext": "mp4"}
+    res = client.post("/api/download", json=body)
+    assert res.status_code == 503 and "disk space" in res.json()["detail"]
+
+
+def test_info_tells_how_many_downloads_are_left(client, monkeypatch):
+    monkeypatch.setattr(main, "_run", lambda *a, **k: (0, '{"title": "t", "formats": []}', ""))
+    assert client.post("/api/info", json={"url": "https://example.com/v"}).json()["downloads_left"] is None
+    monkeypatch.setattr(main, "PUBLIC_MODE", True)
+    monkeypatch.setattr(main, "DOWNLOADS_PER_DAY", 5)
+    assert client.post("/api/info", json={"url": "https://example.com/v"}).json()["downloads_left"] == 5
+
+
+@pytest.mark.parametrize("host, key", [
+    ("203.0.113.7", "203.0.113.7"),
+    ("2001:db8:1:2:aaaa::1", "2001:db8:1:2::/64"),
+    ("2001:db8:1:2:bbbb::9", "2001:db8:1:2::/64"),
+    ("::ffff:203.0.113.7", "203.0.113.7"),
+])
+def test_visitor_key(host, key):
+    request = SimpleNamespace(client=SimpleNamespace(host=host))
+    assert main.visitor_key(request) == key

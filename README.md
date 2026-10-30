@@ -19,6 +19,7 @@ Download videos and audio from YouTube, TikTok, Instagram, Twitter, Reddit, and 
 - 🔄 **Stays working** — updates yt-dlp by itself once a day, because sites change often
 - 🍪 **Cookie support** — age-restricted & member-only content
 - 🔒 **Private by default** — only your computer can open it until you choose otherwise
+- 🌍 **Ready to share** — optional password, or a public mode with limits per visitor
 - 🖥 **Cross-platform** — Windows, macOS, Linux
 - ⚡ **Minimal** — single file backend, zero database
 - 🐳 **Docker** — one command, everything included
@@ -112,27 +113,66 @@ By default only the computer running the app can open it. To use it from your ph
 - **Python:** start it with `HOST=0.0.0.0 python3 main.py` (Windows: `set HOST=0.0.0.0` then `python main.py`), then open `http://<your-computer's-IP>:8080`.
 - **Docker:** in `docker-compose.yml`, change `"127.0.0.1:8080:8080"` to `"8080:8080"`, then run `docker compose up -d`.
 
-**Putting it on the internet?** The app has no password. Anyone who finds it can download through your server and use up your bandwidth. Put it behind a password, for example with nginx (`sudo apt install nginx apache2-utils`, then `sudo htpasswd -c /etc/nginx/.htpasswd yourname`):
+---
+
+## Putting it on the internet
+
+Anyone who can open the app can download through your server and use up your bandwidth, so pick one of these first.
+
+**Just for you, family or friends: set a password.**
+
+```bash
+ACCESS_PASSWORD='pick-a-long-password' python3 main.py
+```
+
+The browser asks for it once (any user name works). With Docker, add `- ACCESS_PASSWORD=pick-a-long-password` under `environment` in `docker-compose.yml`. After 10 wrong tries, a visitor has to wait 15 minutes.
+
+**Open to everyone: turn on public mode.**
+
+```bash
+PUBLIC_MODE=true python3 main.py
+```
+
+Public mode gives every visitor (IP address):
+
+- `DOWNLOADS_PER_DAY` downloads a day (20 by default; failed downloads don't count)
+- at most 2 downloads at once, and 30 link lookups per 10 minutes
+- no access for scripts and bots (curl, Python, headless browsers…); it works from web browsers only
+
+The limits live in memory and start again when the app restarts. You are responsible for how a public server is used, so keep an eye on it.
+
+**Use HTTPS in both cases**, so the password and the links stay private. The easiest way is [Caddy](https://caddyserver.com/docs/install), which gets a certificate by itself. Point your domain at the server, keep the app on `HOST=127.0.0.1`, and put this in `/etc/caddy/Caddyfile`:
+
+```
+yourdomain.com {
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
+Then run `sudo systemctl reload caddy`. (No proxy? Start the app with `HOST=0.0.0.0` instead, but then the password travels unencrypted.)
+
+<details>
+<summary>Using nginx instead</summary>
 
 ```nginx
 server {
     listen 80;
     server_name yourdomain.com;
 
-    auth_basic           "yt-dlp web";
-    auth_basic_user_file /etc/nginx/.htpasswd;
-
     location / {
         proxy_pass http://127.0.0.1:8080;
-        proxy_read_timeout 600s;
-        proxy_send_timeout 600s;
+        proxy_read_timeout 300s;
         proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
     }
 }
 ```
 
-Add HTTPS with [Certbot](https://certbot.eff.org/) so the password is not sent in plain text.
+Add HTTPS with [Certbot](https://certbot.eff.org/): `sudo certbot --nginx -d yourdomain.com`.
+</details>
+
+**Docker behind Caddy or nginx:** the app sees the proxy, not the visitor, so every visitor would share one set of limits. Add `- FORWARDED_ALLOW_IPS=*` under `environment`, and keep the port line as `"127.0.0.1:8080:8080"` so only the proxy can reach the app.
 
 ---
 
@@ -149,6 +189,10 @@ Set these as environment variables before starting the app (Docker: under `envir
 | `DOWNLOAD_TIMEOUT_MINUTES` | `60`    | A download that takes longer is stopped |
 | `COOKIES_FILE`       | `cookies.txt` | Path to the cookies file |
 | `YTDLP_AUTO_UPDATE`  | `true`        | Update yt-dlp at start and every 24 hours |
+| `ACCESS_PASSWORD`    | (none)        | Ask for this password before anything else |
+| `PUBLIC_MODE`        | `false`       | Limits per visitor and no scripts, for a server open to everyone |
+| `DOWNLOADS_PER_DAY`  | `20`          | Downloads per visitor per day in public mode (`0` = no daily limit) |
+| `FORWARDED_ALLOW_IPS`| `127.0.0.1`   | Proxies trusted to pass on the visitor's IP. `*` for Docker behind a proxy |
 | `ALLOW_PRIVATE_URLS` | `false`       | Allow links to local network addresses (`192.168.x.x`, `localhost`…). Leave off on a public server |
 
 **Example:**

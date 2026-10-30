@@ -383,7 +383,7 @@ footer a { color: var(--accent2); text-decoration: none; }
       <span>▶</span> yt-dlp<span class="dot">/</span>web
     </div>
     <h1>Self-hosted <span>video downloader</span></h1>
-    <p class="sub">Powered by yt-dlp · No ads · No limits · Runs locally</p>
+    <p class="sub">Powered by yt-dlp · No ads · Self-hosted</p>
   </header>
 
   <!-- Main card -->
@@ -456,6 +456,9 @@ let currentTitle = '';
 let currentUrl = '';
 let busy = false;
 
+// Sent with every API call; the server refuses API calls without it.
+const API_HEADERS = {'X-Requested-With': 'yt-dlp-web'};
+
 // Messages can contain text from other websites, so they are always
 // shown as plain text, never as HTML.
 function showStatus(el, msg, type = '', spinning = false) {
@@ -517,7 +520,7 @@ async function fetchInfo() {
   try {
     const res = await fetch('/api/info', {
       method: 'POST',
-      headers: {'Content-Type': 'application/json'},
+      headers: {...API_HEADERS, 'Content-Type': 'application/json'},
       body: JSON.stringify({url})
     });
     const data = await res.json().catch(() => ({}));
@@ -565,6 +568,11 @@ async function fetchInfo() {
       if (f.type === 'video') vGrid.appendChild(btn);
       else audioGrid.appendChild(btn);
     });
+    if (data.downloads_left !== null && data.downloads_left !== undefined) {
+      notes.add(data.downloads_left > 0
+        ? `You can download ${data.downloads_left} more file${data.downloads_left === 1 ? '' : 's'} today.`
+        : "You've reached today's download limit. It resets at midnight UTC.");
+    }
     document.getElementById('fmtNote').textContent = [...notes].join(' ');
 
     document.getElementById('infoBox').style.display = 'block';
@@ -608,7 +616,7 @@ async function waitForJob(jobId) {
     await sleep(1000);
     let res, job;
     try {
-      res = await fetch(`/api/jobs/${jobId}`, {cache: 'no-store'});
+      res = await fetch(`/api/jobs/${jobId}`, {cache: 'no-store', headers: API_HEADERS});
       job = await res.json().catch(() => ({}));
     } catch (e) {
       if (++failures >= 10) throw new Error('Lost the connection to the server.');
@@ -640,7 +648,7 @@ async function startDownload() {
   try {
     const res = await fetch('/api/download', {
       method: 'POST',
-      headers: {'Content-Type': 'application/json'},
+      headers: {...API_HEADERS, 'Content-Type': 'application/json'},
       body: JSON.stringify({
         url:           currentUrl,
         format_id:     format.format_id,

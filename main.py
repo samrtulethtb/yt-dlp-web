@@ -4,6 +4,8 @@ Runs on Windows, macOS and Linux.
 """
 
 import asyncio
+import base64
+import binascii
 import ipaddress
 import json
 import logging
@@ -19,13 +21,15 @@ import tempfile
 import threading
 import time
 import unicodedata
+from collections import deque
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote, urlsplit
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 
@@ -53,6 +57,11 @@ AUTO_UPDATE        = _env_flag("YTDLP_AUTO_UPDATE", True)
 UPDATE_EVERY_HOURS = 24
 # Links to local or private network addresses are refused unless this is on.
 ALLOW_PRIVATE_URLS = _env_flag("ALLOW_PRIVATE_URLS", False)
+# Optional password. The browser asks for it once; any user name works.
+ACCESS_PASSWORD    = os.environ.get("ACCESS_PASSWORD", "")
+# For a server open to strangers: limits per visitor and no scripts.
+PUBLIC_MODE        = _env_flag("PUBLIC_MODE", False)
+DOWNLOADS_PER_DAY  = int(os.environ.get("DOWNLOADS_PER_DAY", 20))   # per visitor, public mode only
 FRONTEND_DIR       = Path(__file__).parent / "frontend"
 
 INFO_TIMEOUT_SEC    = 120
@@ -64,6 +73,23 @@ MP3_KBPS_ESTIMATE   = {"0": 245, "128": 128}   # "0" is LAME V0, about 245 kbps
 OUTPUT_EXTENSIONS   = {"mp4", "mp3", "m4a"}
 PARTIAL_SUFFIXES    = (".part", ".ytdl", ".temp", ".tmp")
 TEMP_PREFIX         = "yt-dlp-web-"
+
+# Public mode limits per visitor (IP address; IPv6 per /64 network).
+PUBLIC_ACTIVE_PER_VISITOR = 2      # downloads queued or running at once
+PUBLIC_LOOKUPS            = 30     # link lookups...
+PUBLIC_LOOKUP_WINDOW      = 600    # ...per 10 minutes
+PUBLIC_MAX_QUEUE          = 10     # waiting downloads, all visitors together
+FAILED_LOGINS_ALLOWED     = 10     # wrong passwords per visitor...
+FAILED_LOGIN_WINDOW       = 900    # ...per 15 minutes
+# The page sends this header with every API call. Other websites can't
+# add it to a request without the browser asking this server first, so
+# they can't start downloads through a visitor's browser.
+API_HEADER                = ("X-Requested-With", "yt-dlp-web")
+SCRIPT_AGENTS = re.compile(
+    r"curl|wget|python|httpx|aiohttp|go-http-client|node-fetch|undici|^node$|axios|okhttp|"
+    r"java/|libwww|scrapy|httpie|powershell|postman|insomnia|headless|bot\b|spider|crawler",
+    re.IGNORECASE,
+)
 
 log = logging.getLogger("yt-dlp-web")
 
@@ -410,6 +436,7 @@ def _stop_process(proc: subprocess.Popen) -> None:
         pass
 
 def _fail(job: dict, error: str) -> None:
+    refund_download(job.get("visitor"))
     shutil.rmtree(job["folder"], ignore_errors=True)
     _update(job, status="error", error=error, finished=time.time())
 
@@ -535,6 +562,129 @@ def _remove_leftover_folders() -> None:
         except OSError:
             pass
 
+# ── Access and limits ───────────────────────────────────────────────────
+limits_lock = threading.Lock()
+lookups = {}          # visitor -> deque of lookup times
+daily_downloads = {}  # visitor -> [UTC date, count]
+failed_logins = {}    # visitor -> deque of failure times
+
+def visitor_key(request: Request) -> str:
+    """Who a visitor is for the limits: their IP address, or their /64
+    network for IPv6 (one home connection gets a whole /64)."""
+    host = request.client.host if request.client else "unknown"
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return host
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip.ipv4_mapped:
+            return str(ip.ipv4_mapped)
+        return str(ipaddress.ip_network(f"{ip}/64", strict=False))
+    return str(ip)
+
+def _recent(store: dict, key: str, window: int) -> deque:
+    times = store.setdefault(key, deque())
+    cutoff = time.time() - window
+    while times and times[0] < cutoff:
+        times.popleft()
+    return times
+
+def _today() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+def _used_today(key: str) -> int:
+    day, count = daily_downloads.get(key, (None, 0))
+    return count if day == _today() else 0
+
+def downloads_left(key: str) -> Optional[int]:
+    if not PUBLIC_MODE or DOWNLOADS_PER_DAY <= 0:
+        return None
+    with limits_lock:
+        return max(0, DOWNLOADS_PER_DAY - _used_today(key))
+
+def check_lookup_rate(key: str) -> None:
+    if not PUBLIC_MODE:
+        return
+    with limits_lock:
+        times = _recent(lookups, key, PUBLIC_LOOKUP_WINDOW)
+        if len(times) >= PUBLIC_LOOKUPS:
+            raise HTTPException(429, detail="Too many links in a short time. Please wait a few minutes.")
+        times.append(time.time())
+
+def reserve_download(key: str) -> None:
+    """Refuse a new download when this visitor or the server has had
+    enough; otherwise count it for today."""
+    free = shutil.disk_usage(tempfile.gettempdir()).free
+    if free < 2 * MAX_SIZE_BYTES:
+        raise HTTPException(503, detail="The server is low on disk space. Please try again later.")
+    if not PUBLIC_MODE:
+        return
+    with jobs_lock:
+        active = [j for j in jobs.values() if j["status"] in ("queued", "downloading", "processing")]
+    if sum(1 for j in active if j.get("visitor") == key) >= PUBLIC_ACTIVE_PER_VISITOR:
+        raise HTTPException(429, detail=f"You already have {PUBLIC_ACTIVE_PER_VISITOR} downloads running. "
+                                        "Wait for one to finish.")
+    if sum(1 for j in active if j["status"] == "queued") >= PUBLIC_MAX_QUEUE:
+        raise HTTPException(503, detail="The server is busy. Please try again in a few minutes.")
+    with limits_lock:
+        used = _used_today(key)
+        if DOWNLOADS_PER_DAY > 0 and used >= DOWNLOADS_PER_DAY:
+            raise HTTPException(429, detail=f"You've reached today's limit of {DOWNLOADS_PER_DAY} downloads. "
+                                            "It resets at midnight UTC.")
+        daily_downloads[key] = [_today(), used + 1]
+
+def refund_download(key: Optional[str]) -> None:
+    """A failed download doesn't count against the daily limit."""
+    if not PUBLIC_MODE or not key:
+        return
+    with limits_lock:
+        day, count = daily_downloads.get(key, (None, 0))
+        if day == _today() and count > 0:
+            daily_downloads[key] = [day, count - 1]
+
+def _password_ok(header: str) -> bool:
+    scheme, _, encoded = (header or "").partition(" ")
+    if scheme.lower() != "basic":
+        return False
+    try:
+        decoded = base64.b64decode(encoded.strip(), validate=True).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError):
+        return False
+    password = decoded.partition(":")[2]
+    return secrets.compare_digest(password.encode(), ACCESS_PASSWORD.encode())
+
+def _refuse(status: int, detail: str, **headers) -> JSONResponse:
+    return JSONResponse({"detail": detail}, status_code=status, headers=headers or None)
+
+def check_access(request: Request) -> Optional[JSONResponse]:
+    """Password, script and cross-site checks. Returns a refusal or None."""
+    path = request.url.path
+    if path == "/api/health":
+        return None  # used by Docker's health check
+    key = visitor_key(request)
+
+    if ACCESS_PASSWORD:
+        with limits_lock:
+            failures = _recent(failed_logins, key, FAILED_LOGIN_WINDOW)
+            if len(failures) >= FAILED_LOGINS_ALLOWED:
+                return _refuse(429, "Too many wrong passwords. Try again in 15 minutes.")
+        if not _password_ok(request.headers.get("authorization", "")):
+            if request.headers.get("authorization"):
+                with limits_lock:
+                    failures.append(time.time())
+            return _refuse(401, "Password required.", **{"WWW-Authenticate": 'Basic realm="yt-dlp web", charset="UTF-8"'})
+
+    if not path.startswith("/api/"):
+        return None
+    if PUBLIC_MODE:
+        agent = request.headers.get("user-agent", "")
+        if not agent or SCRIPT_AGENTS.search(agent):
+            return _refuse(403, "This server only works from a web browser.")
+    # The file link is opened by the browser itself, without the header.
+    if not path.endswith("/file") and request.headers.get(API_HEADER[0]) != API_HEADER[1]:
+        return _refuse(403, "Please use the web page to download.")
+    return None
+
 # ── Routes ──────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(_app):
@@ -544,7 +694,14 @@ async def lifespan(_app):
         threading.Thread(target=_auto_update_loop, name="yt-dlp-update", daemon=True).start()
     yield
 
-app = FastAPI(title="yt-dlp Web", version="1.2.0", lifespan=lifespan)
+app = FastAPI(title="yt-dlp Web", version="1.3.0", lifespan=lifespan)
+
+@app.middleware("http")
+async def access_middleware(request: Request, call_next):
+    refusal = check_access(request)
+    if refusal is not None:
+        return refusal
+    return await call_next(request)
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
@@ -554,7 +711,9 @@ async def index():
     return HTMLResponse("<h1>yt-dlp Web: frontend/index.html is missing</h1>")
 
 @app.post("/api/info")
-async def get_info(req: InfoRequest):
+async def get_info(req: InfoRequest, request: Request):
+    key = visitor_key(request)
+    check_lookup_rate(key)
     url = await asyncio.to_thread(check_url, req.url)
     args = _ytdlp_base_args() + ["--dump-json", "--skip-download", "--", url]
     code, stdout, stderr = await asyncio.to_thread(_run, args)
@@ -573,11 +732,12 @@ async def get_info(req: InfoRequest):
         "duration":    data.get("duration"),
         "thumbnail":   data.get("thumbnail", ""),
         "max_size_mb": MAX_SIZE_MB,
+        "downloads_left": downloads_left(key),
         "formats":     build_formats(data),
     }
 
 @app.post("/api/download", status_code=202)
-async def download(req: DownloadRequest):
+async def download(req: DownloadRequest, request: Request):
     url = await asyncio.to_thread(check_url, req.url)
     if req.ext not in OUTPUT_EXTENSIONS:
         raise HTTPException(400, detail="Unknown output format.")
@@ -589,10 +749,12 @@ async def download(req: DownloadRequest):
         raise HTTPException(400, detail="Unknown video format.")
     req.format_id = format_id
 
+    key = visitor_key(request)
+    reserve_download(key)
     job_id = secrets.token_urlsafe(16)
     job = {
         "id": job_id, "status": "queued", "step": "Waiting for another download to finish",
-        "percent": None, "created": time.time(),
+        "percent": None, "created": time.time(), "visitor": key,
         "folder": tempfile.mkdtemp(prefix=TEMP_PREFIX),
     }
     with jobs_lock:
@@ -658,12 +820,16 @@ def _startup_checks() -> None:
         log.warning("ffmpeg was not found: merging video+audio and MP3 conversion will fail. See README.")
     if not (shutil.which("deno") or shutil.which("node")):
         log.warning("No JavaScript runtime found: YouTube may show few or no formats. Install Deno (see README).")
-    if HOST not in ("127.0.0.1", "localhost", "::1"):
+    if HOST not in ("127.0.0.1", "localhost", "::1") and not ACCESS_PASSWORD:
         log.warning(
-            "Listening on %s: anyone who can reach port %s can download through this server. "
-            "Put it behind a password before exposing it to the internet (see README).",
+            "Listening on %s with no password: anyone who can reach port %s can download "
+            "through this server. Set ACCESS_PASSWORD, or PUBLIC_MODE=true for a public "
+            "server (see README).",
             HOST, PORT,
         )
+    if PUBLIC_MODE:
+        log.info("Public mode: %s downloads per visitor per day, %s at once.",
+                 DOWNLOADS_PER_DAY or "unlimited", PUBLIC_ACTIVE_PER_VISITOR)
 
 if __name__ == "__main__":
     import uvicorn
