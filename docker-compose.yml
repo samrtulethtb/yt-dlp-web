@@ -2,10 +2,14 @@ services:
   ytdlp-web:
     build: .
     ports:
-      - "8080:8080"
-    volumes:
-      - ./cookies.txt:/app/cookies.txt:ro  # optional
+      # Only this computer can open the app. To use it from your phone or
+      # other devices on your network, change this line to "8080:8080"
+      # (read "Using it from other devices" in the README first).
+      - "127.0.0.1:8080:8080"
     environment:
-      - PORT=8080
       - MAX_SIZE_MB=500
+    # Optional: log-in cookies for age-restricted or members-only videos.
+    # Create cookies.txt first (see README), then uncomment these two lines.
+    # volumes:
+    #   - ./cookies.txt:/app/cookies.txt:ro
     restart: unless-stopped

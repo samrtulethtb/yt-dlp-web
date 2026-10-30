@@ -420,7 +420,7 @@ footer a { color: var(--accent2); text-decoration: none; }
 
   <footer>
     <a href="https://github.com/yt-dlp/yt-dlp" target="_blank">yt-dlp</a> ·
-    <a href="https://github.com/your-username/ytdlp-web" target="_blank">source</a> ·
+    <a href="https://github.com/samrtulethtb/yt-dlp-web" target="_blank">source</a> ·
     hosted version at <a href="https://noadsdl.com" target="_blank">noadsdl.com</a>
   </footer>
 
@@ -428,11 +428,35 @@ footer a { color: var(--accent2); text-decoration: none; }
 
 <script>
 let selectedFormat = null;
+let currentTitle = '';
 
-function setStatus(msg, type = '') {
-  const el = document.getElementById('status');
+// Messages can contain text from other websites, so they are always
+// shown as plain text, never as HTML.
+function showStatus(el, msg, type = '', busy = false) {
   el.className = 'status ' + type;
-  el.innerHTML = msg;
+  el.textContent = '';
+  if (busy) {
+    const spinner = document.createElement('div');
+    spinner.className = 'spinner';
+    el.appendChild(spinner);
+    el.appendChild(document.createTextNode(' '));
+  }
+  el.appendChild(document.createTextNode(msg));
+}
+
+function setStatus(msg, type = '', busy = false) {
+  showStatus(document.getElementById('status'), msg, type, busy);
+}
+
+// Prefer the full UTF-8 name (filename*=UTF-8''...) so titles with
+// accents, other alphabets or emoji keep their real name.
+function filenameFrom(disposition, fallback) {
+  const utf8 = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8) {
+    try { return decodeURIComponent(utf8[1].trim()); } catch (e) { /* use the plain name */ }
+  }
+  const plain = disposition.match(/filename="([^"]+)"/i) || disposition.match(/filename=([^;]+)/i);
+  return plain ? plain[1].trim() : fallback;
 }
 
 function formatDuration(sec) {
@@ -459,7 +483,7 @@ async function fetchInfo() {
   selectedFormat = null;
 
   document.getElementById('fetchBtn').disabled = true;
-  setStatus('<div class="spinner"></div> Fetching info…');
+  setStatus('Fetching info…', '', true);
 
   try {
     const res = await fetch('/api/info', {
@@ -467,7 +491,7 @@ async function fetchInfo() {
       headers: {'Content-Type':'application/json'},
       body: JSON.stringify({url})
     });
-    const data = await res.json();
+    const data = await res.json().catch(() => ({}));
 
     if (!res.ok) {
       setStatus('✗ ' + (data.detail || 'Error'), 'error');
@@ -476,6 +500,7 @@ async function fetchInfo() {
 
     // Populate info
     document.getElementById('thumb').src = data.thumbnail || '';
+    currentTitle = data.title || '';
     document.getElementById('videoTitle').textContent = data.title;
     document.getElementById('videoMeta').textContent =
       [data.uploader, formatDuration(data.duration)].filter(Boolean).join(' · ');
@@ -489,8 +514,13 @@ async function fetchInfo() {
     data.formats.forEach(f => {
       const btn = document.createElement('button');
       btn.className = 'fmt-btn' + (f.type === 'audio' ? ' audio' : '');
-      const size = f.filesize ? `<span class="filesize">${formatSize(f.filesize)}</span>` : '';
-      btn.innerHTML = f.label + size;
+      btn.textContent = f.label;
+      if (f.filesize) {
+        const size = document.createElement('span');
+        size.className = 'filesize';
+        size.textContent = formatSize(f.filesize);
+        btn.appendChild(size);
+      }
       btn.onclick = () => selectFormat(f, btn);
       if (f.type === 'video') vGrid.appendChild(btn);
       else audioGrid.appendChild(btn);
@@ -526,8 +556,7 @@ async function startDownload() {
   const pw = document.getElementById('progressWrap');
   pw.style.display = 'block';
   document.getElementById('progressFill').style.width = '30%';
-  document.getElementById('dlStatus').innerHTML = '<div class="spinner"></div> Downloading…';
-  document.getElementById('dlStatus').className = 'status';
+  showStatus(document.getElementById('dlStatus'), 'Downloading…', '', true);
 
   try {
     const res = await fetch('/api/download', {
@@ -538,11 +567,12 @@ async function startDownload() {
         format_id:     selectedFormat.format_id,
         ext:           selectedFormat.ext,
         audio_bitrate: selectedFormat.audio_bitrate || '320',
+        title:         currentTitle,
       })
     });
 
     if (!res.ok) {
-      const err = await res.json();
+      const err = await res.json().catch(() => ({}));
       document.getElementById('dlStatus').textContent = '✗ ' + (err.detail || 'Download failed');
       document.getElementById('dlStatus').className = 'status error';
       document.getElementById('progressFill').style.width = '0%';
@@ -558,14 +588,16 @@ async function startDownload() {
     // Trigger browser download
     const blob = await res.blob();
     const disposition = res.headers.get('content-disposition') || '';
-    const match = disposition.match(/filename="?([^"]+)"?/);
-    const filename = match ? match[1] : `download.${selectedFormat.ext}`;
+    const filename = filenameFrom(disposition, `download.${selectedFormat.ext}`);
 
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
     a.download = filename;
+    document.body.appendChild(a);
     a.click();
-    URL.revokeObjectURL(a.href);
+    a.remove();
+    // Give the browser time to start saving before the blob is released.
+    setTimeout(() => URL.revokeObjectURL(a.href), 60000);
 
   } catch (e) {
     document.getElementById('dlStatus').textContent = '✗ ' + e.message;
